@@ -1,5 +1,6 @@
 """BZ optimization demo interface."""
 import io
+import time
 from pathlib import Path
 
 import numpy as np
@@ -10,6 +11,7 @@ import streamlit as st
 
 from block import Block
 from bz_partition_refinement import BZSolver
+from baseline_lp_solver import LPSolver, decode_lp_to_schedule
 from deposit_utils import read_block_model_dataframe
 
 
@@ -79,7 +81,7 @@ def show_bz_demo_section(view_params):
             discount_rate=discount_rate,
             mining_cap=mining_cap,
             max_iters=max_iters,
-            proc_cap_factor=proc_cap_factor
+            proc_cap_factor=proc_cap_factor,
         )
     
     # Display results if they exist in session state
@@ -110,6 +112,10 @@ def run_bz_optimization(view_params, periods, discount_rate, mining_cap, max_ite
         & (df_blocks["z"] >= z_low)
         & (df_blocks["z"] <= z_high)
     ]
+
+    if df_filtered.empty:
+        st.error("No blocks found in the selected range. Please adjust filters.")
+        return
     
     # Convert DataFrame to Block objects
     with st.spinner("Building block graph..."):
@@ -133,7 +139,9 @@ def run_bz_optimization(view_params, periods, discount_rate, mining_cap, max_ite
         # Second pass: add predecessor relationships
         for _, row in df_filtered.iterrows():
             block_id = int(row["BlockID"])
-            block = id_to_block[block_id]
+            block = id_to_block.get(block_id)
+            if block is None: continue
+            
             pred_str = str(row.get("Predecessors", "")).strip()
             if pred_str:
                 pred_ids = [int(x) for x in pred_str.split(";") if x.strip()]
@@ -147,20 +155,36 @@ def run_bz_optimization(view_params, periods, discount_rate, mining_cap, max_ite
     if proc_cap_factor > 0:
         total_ore_tonnage = sum(b.tonnage for b in blocks_opt if b.economic_value > 0)
         proc_cap = total_ore_tonnage * proc_cap_factor
-    
-    # Run solver
-    with st.spinner("Running BZ optimization..."):
-        solver = BZSolver(
+
+    # Run BZ Solver
+    t_start = time.time()
+    with st.spinner("Solving with BZ Partition Refinement..."):
+        bz_solver = BZSolver(
             blocks=blocks_opt,
             periods=periods,
             discount_rate=discount_rate,
             mining_capacity=mining_cap,
             processing_capacity=proc_cap,
         )
-        final_schedule, logs = solver.solve(max_iterations=max_iters)
-    
+        final_schedule, logs = bz_solver.solve(max_iterations=max_iters)
+        bz_npv = logs[-1][1] if logs else 0
+    t_bz = time.time() - t_start
+
+    # Run Baseline LP Solver for comparison
+    t_start_lp = time.time()
+    with st.spinner("Solving Baseline LP for comparison..."):
+        lp_solver = LPSolver(
+            blocks=blocks_opt,
+            periods=periods,
+            discount_rate=discount_rate,
+            mining_capacity=mining_cap,
+            processing_capacity=proc_cap,
+        )
+        _, lp_npv = lp_solver.solve()
+    t_lp = time.time() - t_start_lp
+
     st.success("✓ Optimization complete")
-    
+
     # Store results in session state
     st.session_state["bz_results"] = {
         "final_schedule": final_schedule,
@@ -169,6 +193,11 @@ def run_bz_optimization(view_params, periods, discount_rate, mining_cap, max_ite
         "periods": periods,
         "discount_rate": discount_rate,
         "mining_cap": mining_cap,
+        "bz_npv": bz_npv,
+        "lp_npv": lp_npv,
+        "bz_duration": t_bz,
+        "lp_duration": t_lp,
+        "solver_name": "BZ vs Baseline Comparison"
     }
 
 
@@ -180,35 +209,70 @@ def display_bz_results(results):
     periods = results["periods"]
     discount_rate = results["discount_rate"]
     mining_cap = results["mining_cap"]
+    bz_npv = results.get("bz_npv", 0)
+    lp_npv = results.get("lp_npv", 0)
+    bz_duration = results.get("bz_duration", 0)
+    lp_duration = results.get("lp_duration", 0)
     
-    # Display results
-    st.divider()
-    st.subheader("Optimization Results")
-    
-    # Metrics
-    col1, col2, col3 = st.columns(3)
-    
-    # Calculate final NPV
-    npv_total = 0.0
+    # Calculate final integer NPV
+    int_npv = 0.0
     for bid, period in final_schedule.items():
         if period >= 0:
             df_factor = 1.0 / ((1.0 + discount_rate) ** (period + 1))
-            npv_total += id_to_block[bid].economic_value * df_factor
+            int_npv += id_to_block[bid].economic_value * df_factor
+
+    # Display results
+    st.divider()
+    st.subheader("Optimization Comparison: BZ vs Baseline LP")
     
-    col1.metric("Final NPV ($)", f"${npv_total:,.0f}")
+    # Global LP Comparison Metrics
+    col1, col2, col3 = st.columns(3)
     
-    # Calculate total constraint violations (if available from logs)
+    # Optimality Gap
+    gap = (lp_npv - bz_npv) / lp_npv if lp_npv > 0 else 0
+    col1.metric("Optimality Gap", f"{gap:.4%}", help="Gap between BZ Relaxed Bound and Global LP Optimal NPV")
+    
+    # NPV Comparison
+    col2.metric("Integer Schedule NPV", f"${int_npv:,.0f}", help="Actual NPV after applying TopoSort heuristic")
+    col3.metric("Baseline LP NPV", f"${lp_npv:,.0f}", help="Global optimal relaxed solution")
+    
+    # Timing Comparison
+    col1, col2, col3 = st.columns(3)
+    col1.metric("BZ (Relaxed) NPV", f"${bz_npv:,.0f}", help="Final NPV from the BZ Master LP")
+    col2.metric("BZ Solve Time", f"{bz_duration:.2f}s")
+    col3.metric("Baseline LP Time", f"{lp_duration:.2f}s")
+    
+    # Comparison Chart
+    comp_df = pd.DataFrame({
+        "Result Type": ["Integer (Feasible)", "BZ Master (Relaxed)", "Baseline LP (Global)"],
+        "NPV ($)": [int_npv, bz_npv, lp_npv]
+    })
+    
+    fig_comp = px.bar(
+        comp_df,
+        x="Result Type",
+        y="NPV ($)",
+        color="Result Type",
+        title="Optimization Quality Benchmarks",
+        text_auto='.2s'
+    )
+    st.plotly_chart(fig_comp, use_container_width=True)
+
+    # Heuristic Schedule Metrics
+    st.divider()
+    st.subheader("Mining Schedule Analysis")
+    
+    # Metrics
+    mcol1, mcol2, mcol3 = st.columns(3)
+    
+    # Count scheduled blocks
+    scheduled_count = sum(1 for p in final_schedule.values() if p >= 0)
+    mcol1.metric("Blocks Scheduled", scheduled_count)
+    
+    # Calculate Iterations or Partitions
     if logs and len(logs) > 0:
-        final_log = logs[-1]
-        if len(final_log) >= 3:
-            violation = final_log[2]  # violation_tons
-            col2.metric("Final Constraint Violation (t)", f"{violation:,.0f}")
-            if violation > 0:
-                col3.warning("⚠ Constraints not fully satisfied")
-        else:
-            col2.metric("Iterations", len(logs))
-    else:
-        col2.metric("Iterations", len(logs))
+        mcol2.metric("BZ Iterations", len(logs))
+        mcol3.metric("Final Partitions", logs[-1][2])
     
     # Convergence chart
     if logs and len(logs) > 0:
@@ -389,7 +453,29 @@ def display_bz_results(results):
         if period >= 0 and period < periods:
             tons_per_t[period] += id_to_block[bid].tonnage
     
-    st.bar_chart(tons_per_t.tolist())
+    # Create tonnage chart with Plotly to show capacity line
+    tonnage_df = pd.DataFrame({
+        "Period": [f"P{t+1}" for t in range(periods)],
+        "Mining Tonnage": tons_per_t.tolist()
+    })
+    
+    fig_tonnage = px.bar(
+        tonnage_df,
+        x="Period",
+        y="Mining Tonnage",
+        title=f"Mining Tonnage vs Capacity ({mining_cap:,.0f} t/period)",
+        color_discrete_sequence=["#1f77b4"]
+    )
+    
+    fig_tonnage.add_hline(
+        y=mining_cap, 
+        line_dash="dash", 
+        line_color="red", 
+        annotation_text="Mining Capacity",
+        annotation_position="bottom right"
+    )
+    
+    st.plotly_chart(fig_tonnage, use_container_width=True)
     
     # Show capacity violations
     violations_detected = False
