@@ -4,7 +4,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
-from bz_algorithm_logic import Block, BZScheduler
+from block import Block
+from bz_algorithm_logic import BZScheduler
 from deposit_utils import generate_2d_deposit
 
 

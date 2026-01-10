@@ -1,23 +1,12 @@
+from typing import Dict, List, Tuple
+
 import networkx as nx
 import numpy as np
 import time
 
-class Block:
-    """
-    Represents a single mining block in the model.
-    """
-    def __init__(self, id, x, y, z, tonnage, grade, value):
-        self.id = id
-        self.x = x # Horizontal
-        self.y = y # Vertical (Depth)
-        self.z = z # 3rd Dimension (optional, 0 for 2D)
-        self.tonnage = tonnage
-        self.grade = grade
-        self.economic_value = value
-        self.predecessors = [] # Blocks that must be mined before this one (physically above)
+from block import Block
+from bz_graph import build_closure_graph
 
-    def add_predecessor(self, block):
-        self.predecessors.append(block)
 
 class BZScheduler:
     """
@@ -32,7 +21,14 @@ class BZScheduler:
     5. We iteratively update the multipliers (penalties) until the solution converges
        or satisfies constraints reasonably well.
     """
-    def __init__(self, blocks, periods, discount_rate, mining_capacity, processing_capacity):
+    def __init__(
+        self,
+        blocks: List[Block],
+        periods: int,
+        discount_rate: float,
+        mining_capacity: float,
+        processing_capacity: float,
+    ) -> None:
         self.blocks = blocks
         self.periods = periods
         self.discount_rate = discount_rate
@@ -44,110 +40,11 @@ class BZScheduler:
         self.lambda_mining = np.zeros(periods)
         self.lambda_processing = np.zeros(periods)
 
-    def build_graph(self, multipliers_mining, multipliers_processing):
-        """
-        Constructs the flow network for the closure problem.
-        Nodes are tuples: (block_id, period_index).
-
-        This formulation uses the "By-Period" variable transformation:
-        x_{b,t} = 1 if block b is mined BY period t.
-        """
-        G = nx.DiGraph()
-
-        # Source and Sink for Min-Cut
-        source = 'S'
-        sink = 'T'
-        G.add_node(source)
-        G.add_node(sink)
-
-        # 1. Calculate "Lagrangian Weight" for each node
-        # The weight represents the benefit of mining block 'b' specifically in period 't'
-        # adjusted by the penalty for using resources in that period.
-
-        for t in range(self.periods):
-            # Discount factor for this period
-            df_current = 1 / ((1 + self.discount_rate) ** (t + 1))
-            df_next = 1 / ((1 + self.discount_rate) ** (t + 2)) if t < self.periods - 1 else 0
-
-            current_mining_penalty = multipliers_mining[t]
-            current_proc_penalty = multipliers_processing[t]
-
-            # Penalties applies to the difference between extracting in t vs t+1
-            # But in the "Mined By" formulation, logic is slightly different.
-            # Simplified approach: We assign the Net Present Value increment to the node.
-
-            for block in self.blocks:
-                node_id = (block.id, t)
-
-                # Pure Economic Value of mining in this period vs waiting (or never)
-                # Ideally: Value = (Price - Cost) * Tonnage
-                # Here we use the pre-calculated block.economic_value
-
-                # NPV if mined in period t
-                npv_t = block.economic_value * df_current
-
-                # NPV if mined in period t+1 (Opportunity cost of doing it now)
-                npv_next = block.economic_value * df_next if t < self.periods - 1 else 0
-
-                # Marginal gain of mining in t instead of t+1
-                base_weight = npv_t - npv_next
-
-                # Subtract Penalties (Lagrangian Relaxation)
-                # Penalty = Lambda * Resource_Usage
-                resource_penalty = (block.tonnage * current_mining_penalty)
-
-                # Apply penalty only if it's ore (for processing)
-                if block.economic_value > 0:
-                    resource_penalty += (block.tonnage * current_proc_penalty)
-
-                weight = base_weight - resource_penalty
-
-                # Add Node to Graph with Capacity Logic for Min-Cut
-                # Picard's transformation:
-                # If Weight > 0: Edge S -> Node (Capacity = Weight)
-                # If Weight < 0: Edge Node -> T (Capacity = -Weight)
-
-                G.add_node(node_id, profit=weight)
-
-                if weight > 0:
-                    G.add_edge(source, node_id, capacity=weight)
-                elif weight < 0:
-                    G.add_edge(node_id, sink, capacity=-weight)
-                else:
-                    # Weight is 0, no edge needed to S or T
-                    pass
-
-        # 2. Add Precedence Constraints (Infinite Capacity Edges)
-        for t in range(self.periods):
-            for block in self.blocks:
-                u = (block.id, t)
-
-                # Spatial Precedence:
-                # If we mine Block A (lower) in period t, we must mine Block B (upper) in period t.
-                # Graph Edge: A -> B (Infinite capacity)
-                for pred in block.predecessors:
-                    v = (pred.id, t)
-                    G.add_edge(u, v, capacity=float('inf'))
-
-                # Temporal Precedence (Consistency):
-                # If we mine Block A by period t-1, we effectively have mined it by period t.
-                # In closure logic: If we select (A, t-1), we imply (A, t)?
-                # Actually, standard formulation links (Block, t) -> (Block, t-1).
-                # Meaning: You cannot mine by 't' unless you mined by 't-1'? No.
-                # Correct Logic: If we mine in Period 2, we must have "mined by Period 2".
-                # The constraint is x_{b,t} <= x_{b, t+1} is wrong for Closure.
-                # We want: If we DON'T mine by t+1, we CAN'T mine by t.
-                # Edge: (Block, t) -> (Block, t+1)
-
-                if t < self.periods - 1:
-                    next_period_node = (block.id, t+1)
-                    # If we commit to mining by t, we automatically commit to mining by t+1
-                    # This ensures monotonicity of the "mined by" variable.
-                    G.add_edge(u, next_period_node, capacity=float('inf'))
-
-        return G, source, sink
-
-    def solve(self, max_iterations=20, step_size_factor=0.00005):
+    def solve(
+        self,
+        max_iterations: int = 20,
+        step_size_factor: float = 0.00005,
+    ) -> Tuple[Dict[int, int], List[Tuple[int, float, float]]]:
         """
         The Main BZ Loop.
         """
@@ -155,11 +52,17 @@ class BZScheduler:
         start_time = time.time()
 
         best_objective = float('inf')
-        history = []
+        history: List[Tuple[int, float, float]] = []
 
         for k in range(1, max_iterations + 1):
             # 1. Build Graph with current multipliers
-            G, source, sink = self.build_graph(self.lambda_mining, self.lambda_processing)
+            G, source, sink = build_closure_graph(
+                self.blocks,
+                self.periods,
+                self.discount_rate,
+                self.lambda_mining,
+                self.lambda_processing,
+            )
 
             # 2. Solve Min-Cut (Equivalent to Max Weight Closure)
             # value is the capacity of the cut
@@ -170,7 +73,7 @@ class BZScheduler:
 
             # 3. Decode Solution
             # x[b][t] = 1 if (b,t) is in reachable set
-            current_schedule = {} # block_id -> period extracted (or None)
+            current_schedule: Dict[int, int] = {} # block_id -> period extracted (or None)
 
             # Track resource usage per period to calculate violations
             mining_usage = np.zeros(self.periods)

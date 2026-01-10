@@ -2,3 +2,6 @@ streamlit
 networkx
 numpy
 matplotlib
+scipy
+pandas
+plotlyperlin-noise

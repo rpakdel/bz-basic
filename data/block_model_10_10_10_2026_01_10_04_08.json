@@ -1,0 +1,36 @@
+{
+  "dimensions": {
+    "x": {
+      "min": 0,
+      "max": 9
+    },
+    "y": {
+      "min": 0,
+      "max": 9
+    },
+    "z": {
+      "min": 0,
+      "max": 9
+    }
+  },
+  "attributes": {
+    "tonnage": {
+      "min": 1000.0,
+      "max": 1000.0,
+      "mean": 1000.0,
+      "unit": "tons"
+    },
+    "grade": {
+      "min": 0.1017,
+      "max": 2.9017,
+      "mean": 0.5558119
+    },
+    "economic_value": {
+      "min": -14913.57,
+      "max": 125087.25,
+      "mean": 7790.56153,
+      "unit": "$"
+    }
+  },
+  "generated_at": "2026-01-10T04:08:41.885783"
+}

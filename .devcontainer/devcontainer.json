@@ -8,12 +8,19 @@
 	},
 
 	// Install project requirements after container creation
-	"postCreateCommand": "pip install -r requirements.txt",
+	"postCreateCommand": "conda init && pip install -r requirements.txt",
 	"customizations": {
 		"vscode": {
 			"extensions": [
-			]
-		}
+				"mechatroner.rainbow-csv"
+			],
+			"settings": {        		
+				"mcp": {
+					"servers": {
+					}
+          		}
+        	}        
+      	}
 	}
 
 	// Features to add to the dev container. More info: https://containers.dev/features.
