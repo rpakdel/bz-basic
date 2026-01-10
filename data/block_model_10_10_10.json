@@ -21,22 +21,22 @@
       "unit": "tons"
     },
     "grade": {
-      "min": 0.0072,
-      "max": 2.9017,
-      "mean": 0.5617049
+      "min": 0.0001,
+      "max": 4.058,
+      "mean": 0.6911001
     },
     "economic_value": {
-      "min": -19641.77,
-      "max": 125087.25,
-      "mean": 8085.226340000001,
+      "min": -19992.9,
+      "max": 182897.92,
+      "mean": 14554.996170000002,
       "unit": "$"
     },
     "reserve": {
-      "ore_blocks": 15,
-      "waste_blocks": 11,
-      "overburden_blocks": 974,
+      "ore_blocks": 367,
+      "waste_blocks": 206,
+      "overburden_blocks": 427,
       "description": "1=ore, 0=waste, -1=overburden/other"
     }
   },
-  "generated_at": "2026-01-10T05:42:42.008130"
+  "generated_at": "2026-01-10T06:09:13.651440"
 }

@@ -26,8 +26,8 @@ import pandas as pd
 from perlin_noise import PerlinNoise
 
 # Block model dimensions
-X_SIZE = 25  # Easting extent (blocks)
-Y_SIZE = 25  # Northing extent (blocks)
+X_SIZE = 10  # Easting extent (blocks)
+Y_SIZE = 10  # Northing extent (blocks)
 Z_SIZE = 10  # Elevation extent (blocks)
 
 TONNAGE = 1000
@@ -77,7 +77,7 @@ def grade_value(x: int, y: int, z: int, noise_gen, x_size: int, y_size: int, z_s
     return round(grade, 4), round(economic_value, 2)
 
 
-def generate_contiguous_region(x_size: int, y_size: int, z_size: int, target_size: int = 15, seed_point: tuple = None) -> set:
+def generate_contiguous_region(x_size: int, y_size: int, z_size: int, target_size: int = 50, seed_point: tuple = None) -> set:
     """
     Generate a random contiguous 3D region using flood-fill approach.
     
@@ -129,70 +129,86 @@ def generate_contiguous_region(x_size: int, y_size: int, z_size: int, target_siz
     return region
 
 
-def generate_reserve_regions(x_size: int, y_size: int, z_size: int, min_size: int = 50) -> dict:
+def generate_reserve_regions(x_size: int, y_size: int, z_size: int, min_size: int = 50, num_ore: int = 10, num_waste: int = 10) -> dict:
     """
-    Generate three contiguous reserve regions: ore, waste, and overburden.
+    Generate multiple contiguous reserve regions: ore, waste, and overburden.
     Ore and waste regions are placed close to each other.
     
     Args:
         x_size, y_size, z_size: Model dimensions
         min_size: Minimum blocks per region
+        num_ore: Number of ore regions to generate
+        num_waste: Number of waste regions to generate
     
     Returns:
         Dictionary mapping (x, y, z) coordinates to reserve type (1=ore, 0=waste, -1=overburden)
     """
     reserve_map = {}
     
-    # Generate ore region first (center-ish, middle depth)
-    ore_seed = (
-        random.randint(x_size // 4, 3 * x_size // 4),
-        random.randint(y_size // 4, 3 * y_size // 4),
-        random.randint(z_size // 4, 3 * z_size // 4)
-    )
-    ore_region = generate_contiguous_region(x_size, y_size, z_size, 
-                                            target_size=random.randint(min_size, min_size + 10), 
-                                            seed_point=ore_seed)
+    # Track all used coordinates to avoid overlaps
+    used_coords = set()
+
+    # Generate ore regions
+    for _ in range(num_ore):
+        ore_seed = (
+            random.randint(x_size // 4, 3 * x_size // 4),
+            random.randint(y_size // 4, 3 * y_size // 4),
+            random.randint(z_size // 4, 3 * z_size // 4)
+        )
+        ore_region = generate_contiguous_region(x_size, y_size, z_size, 
+                                                target_size=random.randint(min_size, min_size + 10), 
+                                                seed_point=ore_seed)
+        
+        # Only add blocks that aren't already assigned
+        new_ore_blocks = ore_region - used_coords
+        for coord in new_ore_blocks:
+            reserve_map[coord] = RESERVE_ORE
+        used_coords.update(new_ore_blocks)
     
-    for coord in ore_region:
-        reserve_map[coord] = RESERVE_ORE
+    # Generate waste regions near existing ore (if any)
+    for _ in range(num_waste):
+        ore_blocks = [c for c, v in reserve_map.items() if v == RESERVE_ORE]
+        if ore_blocks:
+            waste_seed = random.choice(ore_blocks)
+            wx, wy, wz = waste_seed
+            waste_seed = (
+                max(0, min(x_size - 1, wx + random.randint(-2, 2))),
+                max(0, min(y_size - 1, wy + random.randint(-2, 2))),
+                max(0, min(z_size - 1, wz + random.randint(-1, 1)))
+            )
+        else:
+            waste_seed = (
+                random.randint(0, x_size - 1),
+                random.randint(0, y_size - 1),
+                random.randint(0, z_size - 1)
+            )
+
+        waste_region = generate_contiguous_region(x_size, y_size, z_size, 
+                                                  target_size=random.randint(min_size, min_size + 10),
+                                                  seed_point=waste_seed)
+        
+        # Remove any overlap with existing regions
+        new_waste_blocks = waste_region - used_coords
+        for coord in new_waste_blocks:
+            reserve_map[coord] = RESERVE_WASTE
+        used_coords.update(new_waste_blocks)
     
-    # Generate waste region near ore (pick a point adjacent to ore region)
-    ore_boundary = list(ore_region)
-    waste_seed = random.choice(ore_boundary)
-    # Offset slightly to ensure it's adjacent but not overlapping
-    wx, wy, wz = waste_seed
-    waste_seed = (
-        max(0, min(x_size - 1, wx + random.randint(-2, 2))),
-        max(0, min(y_size - 1, wy + random.randint(-2, 2))),
-        max(0, min(z_size - 1, wz + random.randint(-1, 1)))
-    )
-    
-    waste_region = generate_contiguous_region(x_size, y_size, z_size, 
-                                              target_size=random.randint(min_size, min_size + 10),
-                                              seed_point=waste_seed)
-    
-    # Remove any overlap with ore
-    waste_region = waste_region - ore_region
-    
-    for coord in waste_region:
-        reserve_map[coord] = RESERVE_WASTE
-    
-    # Generate overburden region (typically near surface, higher Z)
-    overburden_seed = (
-        random.randint(0, x_size - 1),
-        random.randint(0, y_size - 1),
-        random.randint(max(0, z_size - z_size // 3), z_size - 1)  # Upper third
-    )
-    
-    overburden_region = generate_contiguous_region(x_size, y_size, z_size,
-                                                   target_size=random.randint(min_size, min_size + 10),
-                                                   seed_point=overburden_seed)
-    
-    # Remove any overlap with ore and waste
-    overburden_region = overburden_region - ore_region - waste_region
-    
-    for coord in overburden_region:
-        reserve_map[coord] = RESERVE_OVERBURDEN
+    # Generate one or more overburden regions (typically near surface, higher Z)
+    for _ in range(3):  # Let's add multiple overburden regions too
+        overburden_seed = (
+            random.randint(0, x_size - 1),
+            random.randint(0, y_size - 1),
+            random.randint(max(0, z_size - z_size // 3), z_size - 1)  # Upper third
+        )
+        
+        overburden_region = generate_contiguous_region(x_size, y_size, z_size,
+                                                       target_size=random.randint(min_size, min_size + 10),
+                                                       seed_point=overburden_seed)
+        
+        new_overburden_blocks = overburden_region - used_coords
+        for coord in new_overburden_blocks:
+            reserve_map[coord] = RESERVE_OVERBURDEN
+        used_coords.update(new_overburden_blocks)
     
     return reserve_map
 
@@ -247,7 +263,7 @@ def write_csv(x_size: int = X_SIZE, y_size: int = Y_SIZE, z_size: int = Z_SIZE) 
     
     # Generate reserve regions
     print("Generating reserve regions...")
-    reserve_map = generate_reserve_regions(x_size, y_size, z_size, min_size=10)
+    reserve_map = generate_reserve_regions(x_size, y_size, z_size, min_size=50, num_ore=10, num_waste=10)
     
     ore_count = sum(1 for v in reserve_map.values() if v == RESERVE_ORE)
     waste_count = sum(1 for v in reserve_map.values() if v == RESERVE_WASTE)

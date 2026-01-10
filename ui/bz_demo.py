@@ -25,7 +25,7 @@ def show_bz_demo_section(view_params):
             periods = st.number_input(
                 "Periods", 
                 min_value=2, 
-                max_value=10, 
+                max_value=100, 
                 value=4, 
                 step=1,
                 key="bz_periods",
