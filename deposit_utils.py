@@ -291,6 +291,54 @@ def read_block_model_csv(csv_path: str) -> Tuple[List[Block], int, int, int]:
     return blocks, x_size, y_size, z_size
 
 
+def read_block_model_dataframe(csv_path: str) -> pd.DataFrame:
+    """
+    Load a block model CSV and return a DataFrame with BlockID and Predecessors columns added.
+    
+    This is a convenience wrapper around read_block_model_csv() that returns a DataFrame
+    instead of Block objects, useful for visualization and data exploration.
+    
+    Args:
+        csv_path: Path to CSV file (string or Path object)
+    
+    Returns:
+        DataFrame with original columns plus:
+        - BlockID: Calculated block identifier
+        - Value: Alias for economic_value (for compatibility)
+        - Tonnage: Alias for tonnage (capitalized for compatibility)
+        - Predecessors: Semicolon-separated list of predecessor block IDs
+    """
+    # Load as Block objects first
+    blocks, x_size, y_size, z_size = read_block_model_csv(csv_path)
+    
+    # Convert back to DataFrame with all columns
+    data = []
+    for block in blocks:
+        pred_str = ";".join(str(p.id) for p in block.predecessors) if block.predecessors else ""
+        data.append({
+            "x": block.x,
+            "y": block.y,
+            "z": block.z,
+            "tonnage": block.tonnage,
+            "grade": block.grade,
+            "economic_value": block.economic_value,
+            "BlockID": block.id,
+            "Value": block.economic_value,  # Alias for compatibility
+            "Tonnage": block.tonnage,  # Capitalized alias
+            "Predecessors": pred_str,
+        })
+    
+    df = pd.DataFrame(data)
+    
+    # Copy any additional columns from original CSV
+    df_orig = pd.read_csv(csv_path)
+    for col in df_orig.columns:
+        if col not in df.columns:
+            df[col] = df_orig[col]
+    
+    return df
+
+
 def read_blocks_csv(file_bytes: bytes) -> List[Block]:
     """
     Parse a CSV with columns: BlockID, Value, Tonnage, Predecessors.

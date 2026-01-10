@@ -26,9 +26,20 @@ def show_view_model_sidebar():
         selected_name = None
         st.warning("No CSV files found in data/. Add CSVs to proceed.")
 
+    # Load preview to check available columns
+    df_preview = None
+    if selected_name:
+        file_bytes_preview = (data_dir / selected_name).read_bytes()
+        df_preview = pd.read_csv(io.BytesIO(file_bytes_preview))
+    
+    # Determine color options based on available columns
+    color_options = ["tonnage", "grade", "economic_value"]
+    if df_preview is not None and "reserve" in df_preview.columns:
+        color_options.append("reserve")
+    
     color_by = st.selectbox(
         "Color by",
-        options=["tonnage", "grade", "economic_value"],
+        options=color_options,
         index=1,
         key="view_model_color",
     )
@@ -106,29 +117,69 @@ def show_view_model_content(params):
 
     # Show 3D visualization
     st.subheader("3D Block Model")
-    fig3d = px.scatter_3d(
-        df_filtered,
-        x="x",
-        y="y",
-        z="z",
-        color=params["color_by"],
-        color_continuous_scale="Viridis",
-        title=f"Block Model - Colored by {params['color_by'].capitalize()}",
-    )
+    
+    # Special handling for reserve column (categorical)
+    if params["color_by"] == "reserve" and "reserve" in df_filtered.columns:
+        # Map reserve codes to labels
+        df_filtered = df_filtered.copy()
+        df_filtered['reserve_label'] = df_filtered['reserve'].map({
+            1: 'Ore',
+            0: 'Waste',
+            -1: 'Overburden/Other'
+        })
+        
+        fig3d = px.scatter_3d(
+            df_filtered,
+            x="x",
+            y="y",
+            z="z",
+            color='reserve_label',
+            color_discrete_map={
+                'Ore': 'gold',
+                'Waste': 'red',
+                'Overburden/Other': 'lightgray'
+            },
+            title=f"Block Model - Colored by Reserve Type",
+        )
+    else:
+        # Determine appropriate color scale based on data range
+        data_min = df_filtered[params["color_by"]].min()
+        data_max = df_filtered[params["color_by"]].max()
+        
+        # Get full range from metadata if available
+        scale_min = data_min
+        scale_max = data_max
+        if metadata and "attributes" in metadata and params["color_by"] in metadata["attributes"]:
+            color_range = metadata["attributes"][params["color_by"]]
+            if "min" in color_range and "max" in color_range:
+                scale_min = color_range["min"]
+                scale_max = color_range["max"]
+        
+        # Use diverging color scale for data with negative values (like economic_value)
+        color_scale = "Viridis"
+        if scale_min < 0:
+            color_scale = "RdYlGn"  # Red (negative) - Yellow (zero) - Green (positive)
+        
+        # Create figure
+        fig3d = px.scatter_3d(
+            df_filtered,
+            x="x",
+            y="y",
+            z="z",
+            color=params["color_by"],
+            color_continuous_scale=color_scale,
+            title=f"Block Model - Colored by {params['color_by'].capitalize()}",
+        )
+        
+        # Explicitly set color axis range and midpoint
+        fig3d.update_coloraxes(
+            cmin=scale_min,
+            cmax=scale_max,
+            cmid=0 if scale_min < 0 else None
+        )
     
     # Update marker properties
     fig3d.update_traces(marker=dict(size=3, opacity=0.6))
-    
-    # Apply consistent color scale from metadata
-    if metadata and "attributes" in metadata and params["color_by"] in metadata["attributes"]:
-        color_range = metadata["attributes"][params["color_by"]]
-        fig3d.update_layout(
-            coloraxis=dict(
-                colorscale="Viridis",
-                cmin=color_range["min"],
-                cmax=color_range["max"],
-            )
-        )
     
     st.plotly_chart(fig3d, use_container_width=True)
 

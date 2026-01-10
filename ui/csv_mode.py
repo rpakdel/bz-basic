@@ -8,8 +8,9 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
+from block import Block
 from bz_partition_refinement import BZSolver
-from deposit_utils import read_blocks_csv
+from deposit_utils import read_block_model_dataframe
 
 
 def show_csv_sidebar(periods, mining_cap):
@@ -30,8 +31,7 @@ def show_csv_sidebar(periods, mining_cap):
 
     df_preview = None
     if selected_name:
-        file_bytes_preview = (data_dir / selected_name).read_bytes()
-        df_preview = pd.read_csv(io.BytesIO(file_bytes_preview))
+        df_preview = read_block_model_dataframe(str(data_dir / selected_name))
 
     def _bounds(col: str, fallback_min: int = 0, fallback_max: int = 100):
         if df_preview is None or col not in df_preview.columns:
@@ -85,8 +85,9 @@ def show_csv_results(params, periods, discount_rate, mining_cap):
         return
 
     selected_path = data_dir / params["selected_name"]
-    file_bytes = selected_path.read_bytes()
-    df_blocks = pd.read_csv(io.BytesIO(file_bytes))
+    
+    # Use read_block_model_dataframe to automatically calculate BlockID and Predecessors
+    df_blocks = read_block_model_dataframe(str(selected_path))
 
     # Apply spatial filters
     x_low, x_high = params["x_range"]
@@ -104,9 +105,35 @@ def show_csv_results(params, periods, discount_rate, mining_cap):
     required_cols = {"BlockID", "Value", "Tonnage", "Predecessors"}
     can_solve = required_cols.issubset(df_blocks.columns)
     if can_solve:
-        blocks_csv = read_blocks_csv(file_bytes)
-        filtered_ids = set(df_blocks["BlockID"].astype(int))
-        blocks_csv = [b for b in blocks_csv if b.block_id in filtered_ids]
+        # Convert DataFrame to Block objects for the solver
+        blocks_csv = []
+        id_to_block = {}
+        
+        # First pass: create all blocks
+        for _, row in df_blocks.iterrows():
+            block_id = int(row["BlockID"])
+            value = float(row["Value"])
+            tonnage = float(row["Tonnage"])
+            x = int(row["x"])
+            y = int(row["y"])
+            z = int(row["z"])
+            grade = float(row.get("grade", 0.0))
+            
+            block = Block(block_id, x, y, z, tonnage, grade, value)
+            blocks_csv.append(block)
+            id_to_block[block_id] = block
+        
+        # Second pass: add predecessor relationships
+        for _, row in df_blocks.iterrows():
+            block_id = int(row["BlockID"])
+            block = id_to_block[block_id]
+            pred_str = str(row.get("Predecessors", "")).strip()
+            if pred_str:
+                pred_ids = [int(x) for x in pred_str.split(";") if x.strip()]
+                for pred_id in pred_ids:
+                    pred_block = id_to_block.get(pred_id)
+                    if pred_block is not None:
+                        block.add_predecessor(pred_block)
 
     with st.spinner("Running generalized BZ (partition refinement)..."):
         if can_solve:
@@ -131,13 +158,16 @@ def show_csv_results(params, periods, discount_rate, mining_cap):
 
     if metadata and "attributes" in metadata:
         st.subheader("Block Model Metadata")
-        metadata_cols = st.columns(len(metadata["attributes"]))
-        for idx, (attr_name, attr_stats) in enumerate(metadata["attributes"].items()):
-            with metadata_cols[idx]:
-                st.metric(
-                    f"{attr_name.capitalize()} Range",
-                    f"{attr_stats['min']:.2f} - {attr_stats['max']:.2f}"
-                )
+        # Filter out categorical attributes (like reserve) that don't have min/max
+        numeric_attrs = {k: v for k, v in metadata["attributes"].items() if "min" in v and "max" in v}
+        if numeric_attrs:
+            metadata_cols = st.columns(len(numeric_attrs))
+            for idx, (attr_name, attr_stats) in enumerate(numeric_attrs.items()):
+                with metadata_cols[idx]:
+                    st.metric(
+                        f"{attr_name.capitalize()} Range",
+                        f"{attr_stats['min']:.2f} - {attr_stats['max']:.2f}"
+                    )
 
     st.subheader("3D Block Model")
     
@@ -172,10 +202,10 @@ def show_csv_results(params, periods, discount_rate, mining_cap):
         st.bar_chart({"Partitions": [l[2] for l in logs]})
 
         # Final schedule dataframe
-        id_to_block = {b.block_id: b for b in blocks_csv}
+        id_to_block = {b.id: b for b in blocks_csv}
         rows = []
         for bid, period in final_schedule.items():
-            dest = "process" if id_to_block[bid].value > 0 else "waste"
+            dest = "process" if id_to_block[bid].economic_value > 0 else "waste"
             rows.append({"BlockID": bid, "Period": period + 1 if period >= 0 else -1, "Destination": dest})
         st.subheader("Final Schedule")
         st.dataframe(rows)
@@ -188,7 +218,7 @@ def show_csv_results(params, periods, discount_rate, mining_cap):
             if period >= 0:
                 tons_per_t[period] += id_to_block[bid].tonnage
                 df = 1.0 / ((1.0 + discount_rate) ** (period + 1))
-                npv_total += id_to_block[bid].value * df
+                npv_total += id_to_block[bid].economic_value * df
             npv_cum.append(npv_total)
 
         st.subheader("Tonnage Mined per Period")

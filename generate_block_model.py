@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import csv
 import json
+import random
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 
@@ -30,12 +32,15 @@ Z_SIZE = 10  # Elevation extent (blocks)
 
 TONNAGE = 1000
 
+# Reserve types
+RESERVE_ORE = 1
+RESERVE_WASTE = 0
+RESERVE_OVERBURDEN = -1
+
 
 def generate_output_filename(x_size: int, y_size: int, z_size: int) -> Path:
-    """Generate output filename with dimensions and timestamp."""
-    now = datetime.now()
-    timestamp = now.strftime("%Y_%m_%d_%H_%M")
-    filename = f"block_model_{x_size}_{y_size}_{z_size}_{timestamp}.csv"
+    """Generate output filename with dimensions and timestamp."""    
+    filename = f"block_model_{x_size}_{y_size}_{z_size}.csv"
     return Path("data") / filename
 
 
@@ -72,6 +77,155 @@ def grade_value(x: int, y: int, z: int, noise_gen, x_size: int, y_size: int, z_s
     return round(grade, 4), round(economic_value, 2)
 
 
+def generate_contiguous_region(x_size: int, y_size: int, z_size: int, target_size: int = 15, seed_point: tuple = None) -> set:
+    """
+    Generate a random contiguous 3D region using flood-fill approach.
+    
+    Args:
+        x_size, y_size, z_size: Model dimensions
+        target_size: Target number of blocks in region
+        seed_point: Optional (x, y, z) starting point, otherwise random
+    
+    Returns:
+        Set of (x, y, z) coordinates forming a contiguous region
+    """
+    if seed_point is None:
+        # Pick random starting point
+        seed_point = (
+            random.randint(0, x_size - 1),
+            random.randint(0, y_size - 1),
+            random.randint(0, z_size - 1)
+        )
+    
+    region = {seed_point}
+    candidates = deque([seed_point])
+    
+    while len(region) < target_size and candidates:
+        current = candidates.popleft()
+        x, y, z = current
+        
+        # Check all 6 neighbors (±1 in each direction)
+        neighbors = [
+            (x + 1, y, z), (x - 1, y, z),
+            (x, y + 1, z), (x, y - 1, z),
+            (x, y, z + 1), (x, y, z - 1)
+        ]
+        
+        # Randomize order to create irregular shapes
+        random.shuffle(neighbors)
+        
+        for nx, ny, nz in neighbors:
+            # Check bounds
+            if (0 <= nx < x_size and 0 <= ny < y_size and 0 <= nz < z_size):
+                if (nx, ny, nz) not in region:
+                    # Probabilistic growth (90% chance to add neighbor)
+                    if random.random() < 0.9:
+                        region.add((nx, ny, nz))
+                        candidates.append((nx, ny, nz))
+                        
+                        if len(region) >= target_size:
+                            break
+    
+    return region
+
+
+def generate_reserve_regions(x_size: int, y_size: int, z_size: int, min_size: int = 50) -> dict:
+    """
+    Generate three contiguous reserve regions: ore, waste, and overburden.
+    Ore and waste regions are placed close to each other.
+    
+    Args:
+        x_size, y_size, z_size: Model dimensions
+        min_size: Minimum blocks per region
+    
+    Returns:
+        Dictionary mapping (x, y, z) coordinates to reserve type (1=ore, 0=waste, -1=overburden)
+    """
+    reserve_map = {}
+    
+    # Generate ore region first (center-ish, middle depth)
+    ore_seed = (
+        random.randint(x_size // 4, 3 * x_size // 4),
+        random.randint(y_size // 4, 3 * y_size // 4),
+        random.randint(z_size // 4, 3 * z_size // 4)
+    )
+    ore_region = generate_contiguous_region(x_size, y_size, z_size, 
+                                            target_size=random.randint(min_size, min_size + 10), 
+                                            seed_point=ore_seed)
+    
+    for coord in ore_region:
+        reserve_map[coord] = RESERVE_ORE
+    
+    # Generate waste region near ore (pick a point adjacent to ore region)
+    ore_boundary = list(ore_region)
+    waste_seed = random.choice(ore_boundary)
+    # Offset slightly to ensure it's adjacent but not overlapping
+    wx, wy, wz = waste_seed
+    waste_seed = (
+        max(0, min(x_size - 1, wx + random.randint(-2, 2))),
+        max(0, min(y_size - 1, wy + random.randint(-2, 2))),
+        max(0, min(z_size - 1, wz + random.randint(-1, 1)))
+    )
+    
+    waste_region = generate_contiguous_region(x_size, y_size, z_size, 
+                                              target_size=random.randint(min_size, min_size + 10),
+                                              seed_point=waste_seed)
+    
+    # Remove any overlap with ore
+    waste_region = waste_region - ore_region
+    
+    for coord in waste_region:
+        reserve_map[coord] = RESERVE_WASTE
+    
+    # Generate overburden region (typically near surface, higher Z)
+    overburden_seed = (
+        random.randint(0, x_size - 1),
+        random.randint(0, y_size - 1),
+        random.randint(max(0, z_size - z_size // 3), z_size - 1)  # Upper third
+    )
+    
+    overburden_region = generate_contiguous_region(x_size, y_size, z_size,
+                                                   target_size=random.randint(min_size, min_size + 10),
+                                                   seed_point=overburden_seed)
+    
+    # Remove any overlap with ore and waste
+    overburden_region = overburden_region - ore_region - waste_region
+    
+    for coord in overburden_region:
+        reserve_map[coord] = RESERVE_OVERBURDEN
+    
+    return reserve_map
+
+
+def adjust_grade_for_reserve(base_grade: float, base_value: float, reserve_type: int) -> tuple[float, float]:
+    """
+    Adjust grade and economic value based on reserve type.
+    
+    Args:
+        base_grade: Original calculated grade
+        base_value: Original calculated economic value
+        reserve_type: 1 (ore), 0 (waste), -1 (overburden/other)
+    
+    Returns:
+        Adjusted (grade, economic_value) tuple
+    """
+    if reserve_type == RESERVE_ORE:
+        # Boost ore blocks: increase grade by 50-100%
+        multiplier = random.uniform(1.5, 2.0)
+        grade = min(5.0, base_grade * multiplier)
+        economic_value = (grade * 50 - 20) * TONNAGE
+    elif reserve_type == RESERVE_WASTE:
+        # Waste blocks: very low grade, negative economic value
+        grade = random.uniform(0.0, 0.15)
+        economic_value = (grade * 50 - 20) * TONNAGE  # Will be negative
+    else:  # RESERVE_OVERBURDEN or not in any region
+        # Keep original values
+        grade = base_grade
+        economic_value = base_value
+    
+    return round(grade, 4), round(economic_value, 2)
+
+
 def write_csv(x_size: int = X_SIZE, y_size: int = Y_SIZE, z_size: int = Z_SIZE) -> tuple[Path, Path]:
     """Generate and write the block model CSV with Perlin noise variation.
     
@@ -91,15 +245,40 @@ def write_csv(x_size: int = X_SIZE, y_size: int = Y_SIZE, z_size: int = Z_SIZE) 
     # Initialize Perlin noise generator with a seed for reproducibility
     noise_gen = PerlinNoise(octaves=4, seed=42)
     
+    # Generate reserve regions
+    print("Generating reserve regions...")
+    reserve_map = generate_reserve_regions(x_size, y_size, z_size, min_size=10)
+    
+    ore_count = sum(1 for v in reserve_map.values() if v == RESERVE_ORE)
+    waste_count = sum(1 for v in reserve_map.values() if v == RESERVE_WASTE)
+    overburden_count = sum(1 for v in reserve_map.values() if v == RESERVE_OVERBURDEN)
+    
+    print(f"  Ore blocks: {ore_count}")
+    print(f"  Waste blocks: {waste_count}")
+    print(f"  Overburden blocks: {overburden_count}")
+    
     with output_path.open("w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["x", "y", "z", "tonnage", "grade", "economic_value"])
+        writer.writerow(["x", "y", "z", "tonnage", "grade", "economic_value", "reserve"])
 
         for x in range(x_size):
             for y in range(y_size):
                 for z in range(z_size):
-                    grade, value = grade_value(x, y, z, noise_gen, x_size, y_size, z_size)
-                    writer.writerow([x, y, z, TONNAGE, grade, value])
+                    # Get base grade and value from Perlin noise
+                    base_grade, base_value = grade_value(x, y, z, noise_gen, x_size, y_size, z_size)
+                    
+                    # Check if block is in a reserve region
+                    coord = (x, y, z)
+                    reserve_type = reserve_map.get(coord, None)
+                    
+                    # Adjust grade/value if in a reserve region
+                    if reserve_type is not None:
+                        grade, value = adjust_grade_for_reserve(base_grade, base_value, reserve_type)
+                    else:
+                        grade, value = base_grade, base_value
+                        reserve_type = -1  # Default: not in any special region
+                    
+                    writer.writerow([x, y, z, TONNAGE, grade, value, reserve_type])
     
     # Generate metadata JSON file with attribute statistics
     df = pd.read_csv(output_path)
@@ -127,6 +306,12 @@ def write_csv(x_size: int = X_SIZE, y_size: int = Y_SIZE, z_size: int = Z_SIZE) 
                 "mean": float(df["economic_value"].mean()),
                 "unit": "$",
             },
+            "reserve": {
+                "ore_blocks": int((df["reserve"] == 1).sum()),
+                "waste_blocks": int((df["reserve"] == 0).sum()),
+                "overburden_blocks": int((df["reserve"] == -1).sum()),
+                "description": "1=ore, 0=waste, -1=overburden/other"
+            }
         },
         "generated_at": datetime.now().isoformat(),
     }
