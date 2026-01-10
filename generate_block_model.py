@@ -26,8 +26,8 @@ import pandas as pd
 from perlin_noise import PerlinNoise
 
 # Block model dimensions
-X_SIZE = 10  # Easting extent (blocks)
-Y_SIZE = 10  # Northing extent (blocks)
+X_SIZE = 25  # Easting extent (blocks)
+Y_SIZE = 25  # Northing extent (blocks)
 Z_SIZE = 10  # Elevation extent (blocks)
 
 TONNAGE = 1000

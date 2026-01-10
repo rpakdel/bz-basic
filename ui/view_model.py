@@ -190,58 +190,13 @@ def show_view_model_content(params):
     col2.metric("Avg Grade", f"{df_filtered['grade'].mean():.3f}")
     col3.metric("Total Economic Value", f"${df_filtered['economic_value'].sum():,.0f}")
 
+    
     # Show data table
     st.subheader("Block Data Table")
     st.dataframe(df_filtered, use_container_width=True)
-    
-    # Precedence visualization section
-    st.divider()
-    st.header("Precedence Graph Visualization")
-    
-    # Precedence controls in main content area
-    show_precedence = st.checkbox(
-        "Show Precedence Relationships", 
-        value=False, 
-        key="view_model_precedence",
-        help="Visualize block dependencies based on 1:3 slope constraints"
-    )
-    
-    if show_precedence:
-        col1, col2 = st.columns([1, 2])
-        
-        with col1:
-            precedence_mode = st.radio(
-                "Visualization Mode",
-                options=["Single Block", "Region View"],
-                key="precedence_mode",
-                help="Single Block: Focus on one block and its predecessors\nRegion View: Show all precedence in filtered range"
-            )
-        
-        with col2:
-            if precedence_mode == "Single Block":
-                precedence_block_id = st.number_input(
-                    "Block ID to visualize",
-                    min_value=0,
-                    value=1000,
-                    step=1,
-                    key="precedence_block_id",
-                    help="Enter block ID to see its predecessors (blocks that must be mined first)"
-                )
-            else:
-                st.info("Using X, Y, Z ranges from sidebar to define region")
-        
-        # Build params dict for precedence visualization
-        precedence_params = {
-            **params,
-            "show_precedence": show_precedence,
-            "precedence_mode": precedence_mode,
-            "precedence_block_id": precedence_block_id if precedence_mode == "Single Block" else None,
-        }
-        
-        show_precedence_visualization(precedence_params, selected_path, df_filtered)
 
 
-def show_precedence_visualization(params, csv_path, df_filtered):
+def show_precedence_visualization(params, csv_path):
     """Display interactive precedence graph visualization."""
     
     try:
@@ -267,7 +222,7 @@ def show_precedence_visualization(params, csv_path, df_filtered):
         if params["precedence_mode"] == "Single Block":
             show_single_block_precedence(params, blocks, id_to_block, x_size, y_size, z_size)
         else:  # Region View
-            show_region_precedence(params, blocks, id_to_block, x_size, y_size, z_size, df_filtered)
+            show_region_precedence(params, blocks, id_to_block, x_size, y_size, z_size)
             
     except Exception as e:
         st.error(f"Error loading precedence data: {e}")
@@ -378,7 +333,7 @@ def show_single_block_precedence(params, blocks, id_to_block, x_size, y_size, z_
         st.dataframe(pd.DataFrame(pred_data), use_container_width=True)
 
 
-def show_region_precedence(params, blocks, id_to_block, x_size, y_size, z_size, df_filtered):
+def show_region_precedence(params, blocks, id_to_block, x_size, y_size, z_size):
     """Visualize precedence relationships in the filtered region."""
     st.subheader("Region Precedence View")
     

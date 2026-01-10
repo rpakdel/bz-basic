@@ -60,36 +60,43 @@ class BZSolver:
         return G
 
     # ----------------------- Master LP ----------------------- #
-    def _solve_master_lp(self) -> Tuple[np.ndarray, float]:
+    def _solve_master_lp(self) -> Tuple[np.ndarray, np.ndarray, float]:
         """
         Solve a coarse LP over partitions to obtain dual penalties per period.
 
         Variables x_{P,t} ∈ [0, 1] represent fractional extraction of partition P in period t.
-        Objective (maximize): sum_{P,t} value(P) * df(t) * x_{P,t}
-        Subject to per-period mining capacity: sum_{P} tonnage(P) * x_{P,t} <= cap_t
+        Objective (maximize): sum_{P,t} value(P) * df(t) * (x_{P,t} - x_{P,t-1})
+        Wait, BZ master LP usually uses x_{P,t} as mined EXACTLY in period t for simplicity
+        if partitions are disjoint.
 
         Returns:
-          - mu_mining: shadow prices for period capacity constraints
+          - mu_mining: shadow prices for period mining capacity constraints (non-negative)
+          - mu_processing: shadow prices for period processing capacity constraints (non-negative)
           - lp_bound: objective value of the LP (upper bound on NPV)
         """
         P = len(self.partitions)
         T = self.periods
 
-        # Aggregate partition tonnage and value
+        # Aggregate partition tonnage, ore tonnage and value
         part_tonnage = np.zeros(P)
+        part_ore_tonnage = np.zeros(P)
         part_value = np.zeros(P)
         for i, part in enumerate(self.partitions):
             tons = 0.0
+            ore_tons = 0.0
             val = 0.0
             for bid in part:
                 b = self.id_to_block[bid]
                 tons += b.tonnage
+                if b.economic_value > 0:
+                    ore_tons += b.tonnage
                 val += b.economic_value
             part_tonnage[i] = tons
+            part_ore_tonnage[i] = ore_tons
             part_value[i] = val
 
-        # Build LP in canonical form for linprog (minimize c^T x)
-        # We maximize value by minimizing -value
+        # Variables: x_{i,t} is fraction of partition i mined in period t
+        # sum_t x_{i,t} <= 1
         n_vars = P * T
         c = np.zeros(n_vars)
         for i in range(P):
@@ -98,18 +105,44 @@ class BZSolver:
                 idx = i * T + t
                 c[idx] = -part_value[i] * df
 
-        # A_ub x <= b_ub (capacity per period)
-        A_ub = np.zeros((T, n_vars))
-        b_ub = np.full(T, self.mining_capacity)
+        # Constraints
+        A_ub_list = []
+        b_ub_list = []
+
+        # 1. Mining capacity: sum_i part_tonnage[i] * x_{i,t} <= mining_capacity
         for t in range(T):
+            row = np.zeros(n_vars)
             for i in range(P):
-                idx = i * T + t
-                A_ub[t, idx] = part_tonnage[i]
+                row[i * T + t] = part_tonnage[i]
+            A_ub_list.append(row)
+            b_ub_list.append(self.mining_capacity)
 
-        # Bounds 0 <= x <= 1
-        bounds = [(0.0, 1.0)] * n_vars
+        # 2. Processing capacity: sum_i part_ore_tonnage[i] * x_{i,t} <= processing_capacity
+        # Only if processing_capacity > 0
+        has_proc = self.processing_capacity > 0
+        if has_proc:
+            for t in range(T):
+                row = np.zeros(n_vars)
+                for i in range(P):
+                    row[i * T + t] = part_ore_tonnage[i]
+                A_ub_list.append(row)
+                b_ub_list.append(self.processing_capacity)
 
-        # Solve using HiGHS to obtain duals
+        # 3. sum_t x_{i,t} <= 1 for each partition
+        for i in range(P):
+            row = np.zeros(n_vars)
+            for t in range(T):
+                row[i * T + t] = 1.0
+            A_ub_list.append(row)
+            b_ub_list.append(1.0)
+
+        A_ub = np.array(A_ub_list)
+        b_ub = np.array(b_ub_list)
+
+        # Bounds 0 <= x
+        bounds = [(0.0, None)] * n_vars
+
+        # Solve using HiGHS
         res = linprog(
             c=c,
             A_ub=A_ub,
@@ -119,17 +152,16 @@ class BZSolver:
         )
 
         if not res.success:
-            # Fallback: zero duals, zero bound
-            return np.zeros(T), 0.0
+            return np.zeros(T), np.zeros(T), 0.0
 
-        # HiGHS returns marginals for inequality constraints in res.ineqlin.marginals
-        try:
-            mu = np.array(res.ineqlin.marginals)
-        except Exception:
-            mu = np.zeros(T)
+        # Marginals for Ax <= b are non-positive in scipy's minimization.
+        # We want positive shadow prices for the capacities.
+        all_mu = -np.array(res.ineqlin.marginals)
+        mu_mining = all_mu[0:T]
+        mu_processing = all_mu[T : 2 * T] if has_proc else np.zeros(T)
 
         lp_bound = -res.fun
-        return mu, lp_bound
+        return mu_mining, mu_processing, lp_bound
 
     # -------------------- Pricing Subproblem -------------------- #
     def _build_closure_graph(self, mu_mining: np.ndarray, mu_processing: np.ndarray) -> Tuple[nx.DiGraph, str, str]:
@@ -147,19 +179,28 @@ class BZSolver:
                 else 0.0
             )
 
+            # Duals for current and next period
+            m_t = mu_mining[t]
+            m_next = mu_mining[t + 1] if t < self.periods - 1 else 0.0
+            
+            p_t = mu_processing[t]
+            p_next = mu_processing[t + 1] if t < self.periods - 1 else 0.0
+
             for b in self.blocks:
                 node = (b.id, t)
                 base_weight = (b.economic_value * df_current) - (b.economic_value * df_next)
+                
+                mining_penalty = b.tonnage * (m_t - m_next)
+                processing_penalty = 0.0
+                if b.economic_value > 0:
+                    processing_penalty = b.tonnage * (p_t - p_next)
 
-                penalty = b.tonnage * mu_mining[t]
-                if b.economic_value > 0 and mu_processing is not None and len(mu_processing) == self.periods:
-                    penalty += b.tonnage * mu_processing[t]
-
-                w = base_weight - penalty
+                w = base_weight - mining_penalty - processing_penalty
+                
                 G.add_node(node, profit=w)
-                if w > 0:
+                if w > 1e-9:
                     G.add_edge(S, node, capacity=w)
-                elif w < 0:
+                elif w < -1e-9:
                     G.add_edge(node, T_sink, capacity=-w)
 
         # Precedence edges within each period
@@ -224,36 +265,60 @@ class BZSolver:
         # Compute E_b
         E = self._expected_periods(mined_by)
 
+        # Determine which blocks should be mined based on mined_by matrix
+        # A block is in the closure if mined_by[idx, t] > 0 for any period t
+        blocks_to_mine = set()
+        for b in self.blocks:
+            idx = self.id_to_idx[b.id]
+            if np.any(mined_by[idx, :] > 0):
+                blocks_to_mine.add(b.id)
+
         # Kahn's algorithm with tie-break by smallest E_b
-        in_deg = {u: 0 for u in self.G.nodes}
+        # Only consider blocks that are in the closure
+        in_deg = {u: 0 for u in self.G.nodes if u in blocks_to_mine}
         for u, v in self.G.edges:
-            in_deg[v] += 1
+            if u in blocks_to_mine and v in blocks_to_mine:
+                in_deg[v] += 1
 
         ready = [u for u, d in in_deg.items() if d == 0]
         ready.sort(key=lambda u: E.get(u, math.inf))
 
         schedule: Dict[int, int] = {b.id: -1 for b in self.blocks}
         tons_per_t = np.zeros(self.periods)
+        ore_tons_per_t = np.zeros(self.periods)
 
         while ready:
             u = ready.pop(0)
+            block_u = self.id_to_block[u]
+            tonnage_u = block_u.tonnage
+            is_ore = block_u.economic_value > 0
+            
             # Greedy: earliest period with capacity slack
             t_assigned = -1
-            tonnage_u = self.id_to_block[u].tonnage
             for t in range(self.periods):
-                if tons_per_t[t] + tonnage_u <= self.mining_capacity:
+                mining_ok = (tons_per_t[t] + tonnage_u <= self.mining_capacity)
+                proc_ok = True
+                if is_ore and self.processing_capacity > 0:
+                    proc_ok = (ore_tons_per_t[t] + tonnage_u <= self.processing_capacity)
+                
+                if mining_ok and proc_ok:
                     t_assigned = t
                     break
+            
             if t_assigned == -1:
+                # If no period has space, push to the last period (hard constraint violation but completes schedule)
                 t_assigned = self.periods - 1
 
             schedule[u] = t_assigned
             tons_per_t[t_assigned] += tonnage_u
+            if is_ore:
+                ore_tons_per_t[t_assigned] += tonnage_u
 
             for _, v in list(self.G.out_edges(u)):
-                in_deg[v] -= 1
-                if in_deg[v] == 0:
-                    ready.append(v)
+                if v in blocks_to_mine:
+                    in_deg[v] -= 1
+                    if in_deg[v] == 0:
+                        ready.append(v)
             ready.sort(key=lambda x: E.get(x, math.inf))
 
         return schedule
@@ -273,11 +338,9 @@ class BZSolver:
         last_mu = np.copy(self.mu_mining)
 
         for k in range(1, max_iterations + 1):
-            mu, lp_bound = self._solve_master_lp()
-            self.mu_mining = mu
-
-            # Optional: simple processing duals equal to mining duals for demo
-            self.mu_processing = np.copy(self.mu_mining) if self.processing_capacity > 0 else np.zeros(self.periods)
+            mu_m, mu_p, lp_bound = self._solve_master_lp()
+            self.mu_mining = mu_m
+            self.mu_processing = mu_p
 
             Gc, S, Ts = self._build_closure_graph(self.mu_mining, self.mu_processing)
             closure_nodes, _ = self._solve_closure(Gc, S, Ts)
